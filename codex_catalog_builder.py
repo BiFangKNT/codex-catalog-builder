@@ -11,10 +11,12 @@ from typing import Any
 import requests
 from pathlib import Path
 
-# ==================== 1. 路径定义 ====================
+# ==================== 1. 路径与远端配置 ====================
 CONFIG_PATH = Path.home() / ".codex" / "config.toml"
 CACHE_PATH = Path.home() / ".codex" / "models_cache.json"
 CATALOG_PATH = Path.home() / ".codex" / "custom_catalog.json"
+
+GITHUB_MODELS_URL = "https://raw.githubusercontent.com/openai/codex/main/codex-rs/models-manager/models.json"
 
 
 # ==================== 2. 原子写入与配置读取 ====================
@@ -189,52 +191,80 @@ class CodexCatalogApp:
 
         self.items: list[dict[str, Any]] = []
         self.cursor_idx: int = 0
+        self.builtin_models_map: dict[str, dict[str, Any]] = {}
         self.template_model: dict[str, Any] = {}
         self.default_context: int = 272000
-        self.builtin_slugs: set[str] = set()
 
-        self.load_template_and_builtins()
+        # 1. 递进同步官方内置模型（GitHub 优先 -> Local Cache 补充）
+        self.sync_builtin_models()
+        # 2. 从内置模型中提取 template 基准
+        self.extract_template_from_builtins()
+        # 3. 从代理拉取自定义模型并过滤/回显
         self.fetch_and_init_models()
 
-    def load_template_and_builtins(self):
-        """读取内置模型列表与 gpt-5.4 模板基准"""
-        found_template: dict[str, Any] | None = None
+    def sync_builtin_models(self):
+        """
+        二级同步策略：
+        第一级：在线同步 GitHub 官方源（openai/codex/main/.../models.json）
+        第二级：本地 Cache（~/.codex/models_cache.json）补充第一级中没有的 slug
+        """
+        print("🔄 正在同步官方内置模型定义 ...")
+        online_count = 0
+        local_count = 0
+
+        # --- 第一级：GitHub 官方在线源 ---
+        try:
+            resp = requests.get(GITHUB_MODELS_URL, timeout=4)
+            if resp.status_code == 200:
+                raw_data = resp.json()
+                models_list = raw_data.get("models", []) if isinstance(raw_data, dict) else (raw_data if isinstance(raw_data, list) else [])
+                for m in models_list:
+                    if isinstance(m, dict) and "slug" in m:
+                        slug = str(m["slug"])
+                        self.builtin_models_map[slug] = m
+                        online_count += 1
+        except Exception as e:
+            print(f"⚠️ 在线同步 GitHub 源超时/失败 ({e})，将回退至本地缓存。")
+
+        # --- 第二级：本地 Cache 兜底补充 ---
         if CACHE_PATH.exists():
             try:
                 with open(CACHE_PATH, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    raw = data.get("models") or list(data.values()) if isinstance(data, dict) else []
-                    for m in raw:
+                    raw_models = data.get("models", []) if isinstance(data, dict) else (list(data.values()) if isinstance(data, dict) else [])
+                    for m in raw_models:
                         if isinstance(m, dict) and "slug" in m:
                             slug = str(m["slug"])
-                            self.builtin_slugs.add(slug)
-                            if slug == "gpt-5.4":
-                                found_template = m
-                    if not found_template:
-                        for m in raw:
-                            if isinstance(m, dict) and "slug" in m:
-                                found_template = m
-                                break
+                            # 过滤第一级已有的 slug，仅补充缺失项
+                            if slug not in self.builtin_models_map:
+                                self.builtin_models_map[slug] = m
+                                local_count += 1
             except Exception as e:
-                print(f"读取本地 models_cache 失败: {e}")
+                print(f"⚠️ 读取本地 models_cache 失败: {e}")
 
-        if not found_template:
-            found_template = {
-                "slug": "gpt-5.4",
-                "display_name": "gpt-5.4",
-                "description": "Fallback gpt-5.4 template",
-                "visibility": "list",
-                "supported_in_api": True,
-                "priority": 0,
-                "context_window": 272000,
-                "effective_context_window_percent": 0.95,
-                "shell_type": "shell_command",
-                "input_modalities": ["text", "image"],
-                "supported_reasoning_levels": [{"effort": "none", "description": "off"}],
-                "default_reasoning_level": "none"
-            }
-        
-        self.template_model = found_template
+        if not self.builtin_models_map:
+            raise RuntimeError(
+                "❌ 无法获取任何内置模型定义！\n"
+                "原因：在线 GitHub 同步失败且本地 ~/.codex/models_cache.json 不存在。\n"
+                "解决办法：请检查网络连接，或先启动一次官方 Codex 客户端生成本地缓存。"
+            )
+
+        print(f"✅ 内置模型同步完成 (GitHub 在线: {online_count} 个, 本地 Cache 补充: {local_count} 个, 共 {len(self.builtin_models_map)} 个)")
+
+    def extract_template_from_builtins(self):
+        """从同步到的内置模型中动态提取 gpt-5.4 或最新基准作为 Template（无任何硬编码）"""
+        target = self.builtin_models_map.get("gpt-5.4")
+        if not target:
+            # 优先寻找任意 gpt-5 系模型
+            for slug, m in self.builtin_models_map.items():
+                if "gpt-5" in slug:
+                    target = m
+                    break
+        if not target:
+            # 兜底选取第一个内置模型
+            target = next(iter(self.builtin_models_map.values()))
+
+        self.template_model = copy.deepcopy(target)
         self.default_context = int(self.template_model.get("context_window", 272000))
 
     def load_existing_catalog(self) -> dict[str, dict[str, Any]] | None:
@@ -250,13 +280,13 @@ class CodexCatalogApp:
             return None
 
     def fetch_and_init_models(self):
-        """从代理 API 获取模型列表并完成过滤与状态回显"""
+        """从代理 API 获取模型列表并过滤内置模型"""
         url = f"{self.proxy_base.rstrip('/')}/models"
         headers: dict[str, str] = {}
         if self.proxy_key:
             headers["Authorization"] = f"Bearer {self.proxy_key}"
 
-        print(f"正在从 [{self.provider_name}] 获取模型列表 ...")
+        print(f"正在从 [{self.provider_name}] 获取代理模型列表 ...")
         try:
             resp = requests.get(url, headers=headers, timeout=10)
             resp.raise_for_status()
@@ -273,12 +303,12 @@ class CodexCatalogApp:
             if not m_id:
                 continue
 
-            # 1. 过滤内置模型
-            if m_id in self.builtin_slugs:
+            # 1. 过滤已在官方内置库中的模型（避免在自定义列表中重复展示）
+            if m_id in self.builtin_models_map:
                 filtered_builtin_count += 1
                 continue
 
-            # 2. 状态初始化与回显
+            # 2. 自定义模型的状态回显
             state = "included"  # 'included' ([ ]), 'custom' ([x]), 'excluded' ([-])
             custom_ctx: int | None = None
 
@@ -292,7 +322,6 @@ class CodexCatalogApp:
                     else:
                         state = "included"
                 else:
-                    # 历史文件中不存在 -> 说明此前被排除
                     state = "excluded"
 
             self.items.append({
@@ -302,11 +331,10 @@ class CodexCatalogApp:
             })
 
         if filtered_builtin_count > 0:
-            print(f"ℹ️ 已自动过滤 {filtered_builtin_count} 个 Codex 内置官方模型。")
+            print(f"ℹ️ 已过滤 {filtered_builtin_count} 个代理中与官方内置同名的模型（官方定义已自动保留）。")
 
         if not self.items:
-            print("❌ 没有可配置的第三方模型！")
-            sys.exit(1)
+            print("⚠️ 代理未返回任何非内置模型。")
 
     def render_list(self, edit_mode: bool = False):
         term_height = shutil.get_terminal_size().lines
@@ -316,7 +344,7 @@ class CodexCatalogApp:
         scroll_bottom = min(len(self.items), scroll_top + max_display)
 
         sys.stdout.write("\033[H\033[J")
-        print(f"📦 Codex Catalog 配置器 | Provider: \033[1;32m{self.provider_name}\033[0m | 默认: gpt-5.4 ({self.default_context:,} tokens)")
+        print(f"📦 Codex Catalog 配置器 | Provider: \033[1;32m{self.provider_name}\033[0m | 内置模型: {len(self.builtin_models_map)} 个 | 基准 Context: {self.default_context:,}")
         print("=" * 80)
 
         for idx in range(scroll_top, scroll_bottom):
@@ -481,11 +509,17 @@ class CodexCatalogApp:
             self.items[idx]["custom_context"] = None
 
     def apply_and_save(self):
-        generated_models: list[dict[str, Any]] = []
+        # 1. 首先注入全量官方内置模型（保留原生配置）
+        final_catalog: list[dict[str, Any]] = [
+            copy.deepcopy(m) for m in self.builtin_models_map.values()
+        ]
+        builtin_count = len(final_catalog)
+
+        # 2. 追加用户自定义模型
+        custom_added_count = 0
         excluded_count = 0
 
         for it in self.items:
-            # 排除的不写入
             if it["state"] == "excluded":
                 excluded_count += 1
                 continue
@@ -503,13 +537,16 @@ class CodexCatalogApp:
             else:
                 entry["context_window"] = self.default_context
 
-            generated_models.append(entry)
+            final_catalog.append(entry)
+            custom_added_count += 1
 
-        # 原子写入
-        atomic_save_json(CATALOG_PATH, {"models": generated_models})
+        # 3. 原子安全写入
+        atomic_save_json(CATALOG_PATH, {"models": final_catalog})
 
         print("\n" + "=" * 80)
-        print(f"🎉 成功生成 {len(generated_models)} 个模型配置！(已排除 {excluded_count} 个)")
+        print(f"🎉 成功生成 Model Catalog！总计包含 {len(final_catalog)} 个模型：")
+        print(f"   ├─ 🏛️ 官方内置模型: {builtin_count} 个 (自动全量保留)")
+        print(f"   ├─ 🚀 自定义模型:   {custom_added_count} 个 (已排除: {excluded_count} 个)")
         print(f"📁 已安全原子写入至: {CATALOG_PATH}")
         print("=" * 80)
         sys.exit(0)
