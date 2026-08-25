@@ -1,0 +1,21 @@
+[project]
+name = "codex-catalog"
+version = "0.1.0"
+description = "Codex Custom Model Catalog Builder"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "requests>=2.28.0",
+]
+
+[project.scripts]
+# 全局命令名称 = "文件名:入口函数"
+codex-catalog = "codex_catalog_builder:main"
+
+# 明确告诉 hatchling 打包这个单个文件
+[tool.hatch.build.targets.wheel]
+only-include = ["codex_catalog_builder.py"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
