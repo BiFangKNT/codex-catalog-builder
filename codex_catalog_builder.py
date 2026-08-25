@@ -212,7 +212,7 @@ class CodexCatalogApp:
         online_count = 0
         local_count = 0
 
-        # --- 第一级：GitHub 官方在线源 ---
+        # 1. 第一级：GitHub 在线源
         try:
             resp = requests.get(GITHUB_MODELS_URL, timeout=4)
             if resp.status_code == 200:
@@ -226,7 +226,7 @@ class CodexCatalogApp:
         except Exception as e:
             print(f"⚠️ 在线同步 GitHub 源超时/失败 ({e})，将回退至本地缓存。")
 
-        # --- 第二级：本地 Cache 兜底补充 ---
+        # 2. 第二级：本地 Cache 兜底
         if CACHE_PATH.exists():
             try:
                 with open(CACHE_PATH, "r", encoding="utf-8") as f:
@@ -252,7 +252,7 @@ class CodexCatalogApp:
         print(f"✅ 内置模型同步完成 (GitHub 在线: {online_count} 个, 本地 Cache 补充: {local_count} 个, 共 {len(self.builtin_models_map)} 个)")
 
     def extract_template_from_builtins(self):
-        """从同步到的内置模型中动态提取 gpt-5.4 或最新基准作为 Template（无任何硬编码）"""
+        """动态提取基准模板"""
         target = self.builtin_models_map.get("gpt-5.4")
         if not target:
             # 优先寻找任意 gpt-5 系模型
@@ -515,7 +515,15 @@ class CodexCatalogApp:
         ]
         builtin_count = len(final_catalog)
 
-        # 2. 追加用户自定义模型
+        # 2. 动态计算内置模型中的最大 priority
+        builtin_priorities = [
+            int(m.get("priority", 0)) for m in self.builtin_models_map.values()
+            if isinstance(m.get("priority"), (int, float))
+        ]
+        max_builtin_priority = max(builtin_priorities, default=0)
+        start_custom_priority = max_builtin_priority + 1
+
+        # 3. 追加用户自定义模型
         custom_added_count = 0
         excluded_count = 0
 
@@ -530,7 +538,9 @@ class CodexCatalogApp:
             entry["display_name"] = m_id
             entry["visibility"] = "list"
             entry["supported_in_api"] = True
-            entry["priority"] = 0
+            
+            # 自定义模型优先级从 max_builtin_priority + 1 开始顺延
+            entry["priority"] = start_custom_priority + custom_added_count
 
             if it["state"] == "custom" and it["custom_context"] is not None:
                 entry["context_window"] = it["custom_context"]
@@ -540,13 +550,14 @@ class CodexCatalogApp:
             final_catalog.append(entry)
             custom_added_count += 1
 
-        # 3. 原子安全写入
+        # 4. 原子安全写入
         atomic_save_json(CATALOG_PATH, {"models": final_catalog})
 
         print("\n" + "=" * 80)
         print(f"🎉 成功生成 Model Catalog！总计包含 {len(final_catalog)} 个模型：")
-        print(f"   ├─ 🏛️ 官方内置模型: {builtin_count} 个 (自动全量保留)")
-        print(f"   ├─ 🚀 自定义模型:   {custom_added_count} 个 (已排除: {excluded_count} 个)")
+        print(f"   ├─ 🏛️ 官方内置模型: {builtin_count} 个 (最大 Priority: {max_builtin_priority})")
+        print(f"   ├─ 🚀 自定义模型:   {custom_added_count} 个 (Priority 范围: {start_custom_priority} ~ {start_custom_priority + custom_added_count - 1})")
+        print(f"   └─ 🚫 已排除模型:   {excluded_count} 个")
         print(f"📁 已安全原子写入至: {CATALOG_PATH}")
         print("=" * 80)
         sys.exit(0)
