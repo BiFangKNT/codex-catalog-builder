@@ -17,9 +17,25 @@ CACHE_PATH = Path.home() / ".codex" / "models_cache.json"
 CATALOG_PATH = Path.home() / ".codex" / "custom_catalog.json"
 
 
-# ==================== 2. 动态读取 config.toml ====================
+# ==================== 2. 原子写入与配置读取 ====================
+def atomic_save_json(path: Path, data: dict[str, Any]) -> None:
+    """原子写入 JSON 文件，防止断电/强退导致文件损坏"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(f".tmp.{os.getpid()}")
+    try:
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())  # 强制刷入物理磁盘
+        os.replace(temp_path, path)  # 原子替换
+    except Exception:
+        if temp_path.exists():
+            temp_path.unlink(missing_ok=True)
+        raise
+
+
 def load_proxy_config() -> tuple[str, str, str]:
-    """从 ~/.codex/config.toml 中动态读取 model_provider 及其 base_url、bearer_token"""
+    """从 ~/.codex/config.toml 中读取 model_provider 配置"""
     if not CONFIG_PATH.exists():
         raise FileNotFoundError(f"未找到 Codex 配置文件: {CONFIG_PATH}")
 
@@ -54,7 +70,7 @@ if os.name == 'nt':
     import msvcrt
     def get_key() -> str:
         ch = msvcrt.getch()
-        if ch == b'\x03':  # Ctrl+C 强制退出
+        if ch == b'\x03':  # Ctrl+C
             raise KeyboardInterrupt
         if ch in (b'\x00', b'\xe0'):
             ch2 = msvcrt.getch()
@@ -79,7 +95,7 @@ else:
         try:
             tty.setraw(fd)
             ch = sys.stdin.read(1)
-            if ch == '\x03':  # Ctrl+C 强制退出
+            if ch == '\x03':  # Ctrl+C
                 raise KeyboardInterrupt
             if ch == '\x1b':
                 r, _, _ = select.select([sys.stdin], [], [], 0.05)
@@ -100,12 +116,7 @@ else:
 
 
 def custom_input(prompt: str) -> str | None:
-    """
-    替换标准 input()，支持：
-    - 按 ESC 随时取消操作并返回 None
-    - 按 Ctrl+C 立即退出
-    - 支持退格删除 (Backspace) 与回车提交
-    """
+    """支持 ESC 取消、Ctrl+C 强退、退格的交互式输入"""
     sys.stdout.write(prompt)
     sys.stdout.flush()
     buf: list[str] = []
@@ -132,7 +143,6 @@ def custom_input(prompt: str) -> str | None:
 
 # ==================== 4. 辅助函数 ====================
 def parse_token_input(val_str: str, default_val: int) -> int:
-    """解析输入的数值，支持 200k / 1m 等简写"""
     s = val_str.strip().lower()
     if not s:
         return default_val
@@ -148,7 +158,6 @@ def parse_token_input(val_str: str, default_val: int) -> int:
 
 
 def parse_range_indices(input_str: str, max_len: int) -> list[int]:
-    """解析如 1, 3, 5-8, 10~12 的范围字符串，返回 0-based 索引列表"""
     res: set[int] = set()
     parts = [p.strip() for p in input_str.replace('，', ',').split(',') if p.strip()]
     for part in parts:
@@ -182,12 +191,13 @@ class CodexCatalogApp:
         self.cursor_idx: int = 0
         self.template_model: dict[str, Any] = {}
         self.default_context: int = 272000
+        self.builtin_slugs: set[str] = set()
 
-        self.load_template()
-        self.fetch_models()
+        self.load_template_and_builtins()
+        self.fetch_and_init_models()
 
-    def load_template(self):
-        """优先提取 slug 为 gpt-5.4 的模板"""
+    def load_template_and_builtins(self):
+        """读取内置模型列表与 gpt-5.4 模板基准"""
         found_template: dict[str, Any] | None = None
         if CACHE_PATH.exists():
             try:
@@ -195,9 +205,11 @@ class CodexCatalogApp:
                     data = json.load(f)
                     raw = data.get("models") or list(data.values()) if isinstance(data, dict) else []
                     for m in raw:
-                        if isinstance(m, dict) and m.get("slug") == "gpt-5.4":
-                            found_template = m
-                            break
+                        if isinstance(m, dict) and "slug" in m:
+                            slug = str(m["slug"])
+                            self.builtin_slugs.add(slug)
+                            if slug == "gpt-5.4":
+                                found_template = m
                     if not found_template:
                         for m in raw:
                             if isinstance(m, dict) and "slug" in m:
@@ -225,88 +237,134 @@ class CodexCatalogApp:
         self.template_model = found_template
         self.default_context = int(self.template_model.get("context_window", 272000))
 
-    def fetch_models(self):
-        """从代理 API 获取模型列表"""
+    def load_existing_catalog(self) -> dict[str, dict[str, Any]] | None:
+        """读取已有的 custom_catalog.json 以实现状态回显与幂等"""
+        if not CATALOG_PATH.exists():
+            return None
+        try:
+            with open(CATALOG_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                models = data.get("models", [])
+                return {m["slug"]: m for m in models if isinstance(m, dict) and "slug" in m}
+        except Exception:
+            return None
+
+    def fetch_and_init_models(self):
+        """从代理 API 获取模型列表并完成过滤与状态回显"""
         url = f"{self.proxy_base.rstrip('/')}/models"
         headers: dict[str, str] = {}
         if self.proxy_key:
             headers["Authorization"] = f"Bearer {self.proxy_key}"
 
-        print(f"正在从 [{self.provider_name}] ({url}) 获取模型列表 ...")
+        print(f"正在从 [{self.provider_name}] 获取模型列表 ...")
         try:
             resp = requests.get(url, headers=headers, timeout=10)
             resp.raise_for_status()
             data = resp.json().get("data", [])
-            for item in data:
-                m_id = item["id"]
-                self.items.append({
-                    "id": m_id,
-                    "checked": False,
-                    "custom_context": None
-                })
         except Exception as e:
             print(f"❌ 获取模型失败: {e}")
             sys.exit(1)
 
+        existing_catalog = self.load_existing_catalog()
+        filtered_builtin_count = 0
+
+        for item in data:
+            m_id = str(item.get("id", ""))
+            if not m_id:
+                continue
+
+            # 1. 过滤内置模型
+            if m_id in self.builtin_slugs:
+                filtered_builtin_count += 1
+                continue
+
+            # 2. 状态初始化与回显
+            state = "included"  # 'included' ([ ]), 'custom' ([x]), 'excluded' ([-])
+            custom_ctx: int | None = None
+
+            if existing_catalog is not None:
+                if m_id in existing_catalog:
+                    entry = existing_catalog[m_id]
+                    ctx = entry.get("context_window")
+                    if ctx is not None and ctx != self.default_context:
+                        state = "custom"
+                        custom_ctx = int(ctx)
+                    else:
+                        state = "included"
+                else:
+                    # 历史文件中不存在 -> 说明此前被排除
+                    state = "excluded"
+
+            self.items.append({
+                "id": m_id,
+                "state": state,
+                "custom_context": custom_ctx
+            })
+
+        if filtered_builtin_count > 0:
+            print(f"ℹ️ 已自动过滤 {filtered_builtin_count} 个 Codex 内置官方模型。")
+
         if not self.items:
-            print("❌ 代理未返回任何可用模型！")
+            print("❌ 没有可配置的第三方模型！")
             sys.exit(1)
 
     def render_list(self, edit_mode: bool = False):
         term_height = shutil.get_terminal_size().lines
-        max_display = max(8, term_height - 10)
+        max_display = max(8, term_height - 11)
         
         scroll_top = max(0, min(self.cursor_idx - max_display // 2, len(self.items) - max_display))
         scroll_bottom = min(len(self.items), scroll_top + max_display)
 
         sys.stdout.write("\033[H\033[J")
-        print(f"📦 Codex Model Catalog 配置器 | Provider: \033[1;32m{self.provider_name}\033[0m | 默认: gpt-5.4 ({self.default_context:,} tokens)")
-        print("=" * 75)
+        print(f"📦 Codex Catalog 配置器 | Provider: \033[1;32m{self.provider_name}\033[0m | 默认: gpt-5.4 ({self.default_context:,} tokens)")
+        print("=" * 80)
 
         for idx in range(scroll_top, scroll_bottom):
             item = self.items[idx]
-            check_mark = "[x]" if item["checked"] else "[ ]"
-            
-            if item["custom_context"] is not None:
+            st = item["state"]
+
+            if st == "custom":
+                check_mark = "\033[1;32m[x]\033[0m"
                 val_str = f"{item['custom_context']:,} tokens"
-            elif item["checked"]:
-                val_str = "待输入配置"
-            else:
+            elif st == "excluded":
+                check_mark = "\033[1;31m[-]\033[0m"
+                val_str = "\033[90m(已排除 - 不写入)\033[0m"
+            else:  # included
+                check_mark = "[ ]"
                 val_str = f"(默认: {self.default_context:,})"
 
             line = f"{check_mark} {idx + 1:2d}. {item['id']:<42} Context: {val_str}"
 
             if edit_mode and idx == self.cursor_idx:
-                sys.stdout.write(f"\033[1;36;7m> {line:<71}\033[0m\n")
+                sys.stdout.write(f"\033[1;36;7m> {line:<76}\033[0m\n")
             else:
                 sys.stdout.write(f"  {line}\n")
 
-        print("=" * 75)
+        print("=" * 80)
 
     def prompt_for_item_context(self, idx: int, current_step: int, total_steps: int) -> bool:
-        """为单个选中项配置 context_window。按 ESC 返回 False 中断"""
         item = self.items[idx]
         cur_val = item["custom_context"] or self.default_context
         prompt = (
             f"\n配置 [{current_step}/{total_steps}] 模型 \033[1;33m{item['id']}\033[0m 的 context_window\n"
-            f"(当前: {cur_val:,}，支持 200k/128k/1m，直接回车保持，按 ESC 放弃本次配置): "
+            f"(当前: {cur_val:,}，支持输入如 200k/128k/1m，直接回车保持，按 ESC 放弃本次操作): "
         )
         val_in = custom_input(prompt)
         if val_in is None:
-            return False  # 用户按了 ESC
+            return False
         if val_in:
-            parsed = parse_token_input(val_in, cur_val)
-            item["custom_context"] = parsed
+            item["custom_context"] = parse_token_input(val_in, cur_val)
         elif item["custom_context"] is None:
             item["custom_context"] = cur_val
+        item["state"] = "custom"
         return True
 
     def run_edit_mode(self):
-        orig_states = [(it["checked"], it["custom_context"]) for it in self.items]
+        orig_states = [(it["state"], it["custom_context"]) for it in self.items]
         
         while True:
             self.render_list(edit_mode=True)
-            print("【编辑模式】[↑/↓]移动光标 | [空格]选中/取消 | [a]全选/全消 | [Enter]确定配置 | [ESC]取消返回")
+            print("【编辑模式】[↑/↓]移动 | [空格]自定义[x] | [e]排除/恢复[-] | [a]全选[x] | [x]全排除[-] | [Enter]确定 | [ESC]取消")
             
             key = get_key()
             if key == 'UP':
@@ -314,39 +372,55 @@ class CodexCatalogApp:
             elif key == 'DOWN':
                 self.cursor_idx = (self.cursor_idx + 1) % len(self.items)
             elif key == 'SPACE':
-                self.items[self.cursor_idx]["checked"] = not self.items[self.cursor_idx]["checked"]
+                cur = self.items[self.cursor_idx]
+                if cur["state"] == "custom":
+                    cur["state"] = "included"
+                    cur["custom_context"] = None
+                else:
+                    cur["state"] = "custom"
+            elif key in ('e', 'E'):
+                cur = self.items[self.cursor_idx]
+                if cur["state"] == "excluded":
+                    cur["state"] = "included"
+                else:
+                    cur["state"] = "excluded"
+                    cur["custom_context"] = None
             elif key in ('a', 'A'):
-                all_checked = all(it["checked"] for it in self.items)
+                all_custom = all(it["state"] == "custom" for it in self.items)
                 for it in self.items:
-                    it["checked"] = not all_checked
+                    it["state"] = "included" if all_custom else "custom"
+                    if it["state"] == "included":
+                        it["custom_context"] = None
+            elif key in ('x', 'X'):
+                all_excluded = all(it["state"] == "excluded" for it in self.items)
+                for it in self.items:
+                    it["state"] = "included" if all_excluded else "excluded"
+                    if it["state"] == "excluded":
+                        it["custom_context"] = None
             elif key == 'ESC':
-                for i, (chk, ctx) in enumerate(orig_states):
-                    self.items[i]["checked"] = chk
+                for i, (st, ctx) in enumerate(orig_states):
+                    self.items[i]["state"] = st
                     self.items[i]["custom_context"] = ctx
                 break
             elif key == 'ENTER':
-                selected_indices = [i for i, it in enumerate(self.items) if it["checked"]]
-                if selected_indices:
+                custom_indices = [i for i, it in enumerate(self.items) if it["state"] == "custom"]
+                if custom_indices:
                     canceled = False
-                    for step, idx in enumerate(selected_indices, 1):
-                        ok = self.prompt_for_item_context(idx, step, len(selected_indices))
+                    for step, idx in enumerate(custom_indices, 1):
+                        ok = self.prompt_for_item_context(idx, step, len(custom_indices))
                         if not ok:
-                            for i, (chk, ctx) in enumerate(orig_states):
-                                self.items[i]["checked"] = chk
+                            for i, (st, ctx) in enumerate(orig_states):
+                                self.items[i]["state"] = st
                                 self.items[i]["custom_context"] = ctx
                             canceled = True
                             break
                     if canceled:
                         break
-
-                for i, it in enumerate(self.items):
-                    if not it["checked"]:
-                        it["custom_context"] = None
                 break
 
     def run_select_mode(self):
         self.render_list(edit_mode=False)
-        print("【选中模式】请输入要选中的序号 (例如: 1, 3, 5-8 或 10~12，按 ESC 取消返回)")
+        print("【选中模式】请输入要自定义 Context 的序号 (例如: 1, 3, 5-8 或 10~12，按 ESC 返回)")
         val_in = custom_input("序号: ")
         if val_in is None or not val_in:
             return
@@ -357,36 +431,66 @@ class CodexCatalogApp:
             custom_input("按回车继续...")
             return
 
-        orig_backup = {idx: (self.items[idx]["checked"], self.items[idx]["custom_context"]) for idx in indices}
+        orig_backup = {idx: (self.items[idx]["state"], self.items[idx]["custom_context"]) for idx in indices}
 
         for idx in indices:
-            self.items[idx]["checked"] = True
+            self.items[idx]["state"] = "custom"
 
         for step, idx in enumerate(indices, 1):
             ok = self.prompt_for_item_context(idx, step, len(indices))
             if not ok:
-                for i, (chk, ctx) in orig_backup.items():
-                    self.items[i]["checked"] = chk
+                for i, (st, ctx) in orig_backup.items():
+                    self.items[i]["state"] = st
                     self.items[i]["custom_context"] = ctx
                 break
 
     def run_deselect_mode(self):
         self.render_list(edit_mode=False)
-        print("【取消选中模式】请输入要取消的序号 (例如: 1, 3, 5-8 或 10~12，按 ESC 取消返回)")
+        print("【取消选中模式】请输入要重置为默认的序号 (例如: 1, 3, 5-8，按 ESC 返回)")
         val_in = custom_input("序号: ")
         if val_in is None or not val_in:
             return
 
         indices = parse_range_indices(val_in, len(self.items))
         for idx in indices:
-            self.items[idx]["checked"] = False
+            self.items[idx]["state"] = "included"
+            self.items[idx]["custom_context"] = None
+
+    def run_exclude_mode(self):
+        self.render_list(edit_mode=False)
+        print("【排除模式】请输入要排除（不写入文件）的序号 (例如: 1, 3, 5-8，按 ESC 返回)")
+        val_in = custom_input("序号: ")
+        if val_in is None or not val_in:
+            return
+
+        indices = parse_range_indices(val_in, len(self.items))
+        for idx in indices:
+            self.items[idx]["state"] = "excluded"
+            self.items[idx]["custom_context"] = None
+
+    def run_unexclude_mode(self):
+        self.render_list(edit_mode=False)
+        print("【取消排除模式】请输入要恢复写入的序号 (例如: 1, 3, 5-8，按 ESC 返回)")
+        val_in = custom_input("序号: ")
+        if val_in is None or not val_in:
+            return
+
+        indices = parse_range_indices(val_in, len(self.items))
+        for idx in indices:
+            self.items[idx]["state"] = "included"
             self.items[idx]["custom_context"] = None
 
     def apply_and_save(self):
         generated_models: list[dict[str, Any]] = []
+        excluded_count = 0
+
         for it in self.items:
+            # 排除的不写入
+            if it["state"] == "excluded":
+                excluded_count += 1
+                continue
+
             m_id: str = it["id"]
-            # 明确类型为 dict[str, Any]，消除 Optional 下标警告
             entry: dict[str, Any] = copy.deepcopy(self.template_model)
             entry["slug"] = m_id
             entry["display_name"] = m_id
@@ -394,28 +498,27 @@ class CodexCatalogApp:
             entry["supported_in_api"] = True
             entry["priority"] = 0
 
-            if it["checked"] and it["custom_context"] is not None:
+            if it["state"] == "custom" and it["custom_context"] is not None:
                 entry["context_window"] = it["custom_context"]
             else:
                 entry["context_window"] = self.default_context
 
             generated_models.append(entry)
 
-        CATALOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with open(CATALOG_PATH, "w", encoding="utf-8") as f:
-            json.dump({"models": generated_models}, f, indent=2, ensure_ascii=False)
+        # 原子写入
+        atomic_save_json(CATALOG_PATH, {"models": generated_models})
 
-        print("\n" + "=" * 75)
-        print(f"🎉 成功生成 {len(generated_models)} 个模型配置！")
-        print(f"📁 已写入至: {CATALOG_PATH}")
-        print("=" * 75)
+        print("\n" + "=" * 80)
+        print(f"🎉 成功生成 {len(generated_models)} 个模型配置！(已排除 {excluded_count} 个)")
+        print(f"📁 已安全原子写入至: {CATALOG_PATH}")
+        print("=" * 80)
         sys.exit(0)
 
     def run(self):
         while True:
             self.render_list(edit_mode=False)
-            print("【主菜单】[1] 编辑  [2] 选中  [3] 取消选中  [4] 应用并退出 (随时按 Ctrl+C 退出)")
-            sys.stdout.write("请按数字键选择 (1-4): ")
+            print("【主菜单】[1] 编辑  [2] 选中  [3] 取消选中  [4] 排除  [5] 恢复排除  [6] 应用并退出")
+            sys.stdout.write("请按数字键选择 (1-6, Ctrl+C 退出): ")
             sys.stdout.flush()
 
             key = get_key()
@@ -426,6 +529,10 @@ class CodexCatalogApp:
             elif key == '3':
                 self.run_deselect_mode()
             elif key == '4':
+                self.run_exclude_mode()
+            elif key == '5':
+                self.run_unexclude_mode()
+            elif key == '6':
                 self.apply_and_save()
 
 
