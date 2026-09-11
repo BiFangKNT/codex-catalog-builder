@@ -10,6 +10,7 @@ import tomllib
 from typing import Any
 import requests
 from pathlib import Path
+import re
 
 # ==================== 1. 路径与远端配置 ====================
 CONFIG_PATH = Path.home() / ".codex" / "config.toml"
@@ -179,6 +180,21 @@ def parse_range_indices(input_str: str, max_len: int) -> list[int]:
                 res.add(idx - 1)
     return sorted(list(res))
 
+def parse_model_version(slug: str) -> tuple[int, int]:
+    """
+    从模型 slug 中动态提取主次版本号，例如：
+    'gpt-6-astra' -> (6, 0)
+    'gpt-5.6-terra' -> (5, 6)
+    'gpt-5.5' -> (5, 5)
+    'o3-mini' -> (3, 0)
+    """
+    matches = re.findall(r'(?:^|[^\d])(\d+)(?:\.(\d+))?(?:[^\d]|$)', slug)
+    if matches:
+        major = int(matches[0][0])
+        minor = int(matches[0][1]) if matches[0][1] else 0
+        return (major, minor)
+    return (0, 0)
+
 
 # ==================== 5. 核心 TUI 状态管理器 ====================
 class CodexCatalogApp:
@@ -192,13 +208,14 @@ class CodexCatalogApp:
         self.items: list[dict[str, Any]] = []
         self.cursor_idx: int = 0
         self.builtin_models_map: dict[str, dict[str, Any]] = {}
+        self.active_candidates: list[dict[str, Any]] = []
         self.template_model: dict[str, Any] = {}
         self.default_context: int = 272000
 
         # 1. 递进同步官方内置模型（GitHub 优先 -> Local Cache 补充）
         self.sync_builtin_models()
-        # 2. 从内置模型中提取 template 基准
-        self.extract_template_from_builtins()
+        # 2. 交互式选择 template 基准 (直接回车即默认)
+        self.select_template_interactively()
         # 3. 从代理拉取自定义模型并过滤/回显
         self.fetch_and_init_models()
 
@@ -251,21 +268,123 @@ class CodexCatalogApp:
 
         print(f"✅ 内置模型同步完成 (GitHub 在线: {online_count} 个, 本地 Cache 补充: {local_count} 个, 共 {len(self.builtin_models_map)} 个)")
 
-    def extract_template_from_builtins(self):
-        """动态提取基准模板"""
-        target = self.builtin_models_map.get("gpt-5.4")
-        if not target:
-            # 优先寻找任意 gpt-5 系模型
-            for slug, m in self.builtin_models_map.items():
-                if "gpt-5" in slug:
-                    target = m
-                    break
-        if not target:
-            # 兜底选取第一个内置模型
-            target = next(iter(self.builtin_models_map.values()))
+    def sanitize_template(self, template: dict[str, Any]) -> None:
+        """安全清洗基准模板，拔除所有特定于原模型的污染项"""
+        template["upgrade"] = None
+        template["availability_nux"] = None
+        template["visibility"] = "list"
+        template["supported_in_api"] = True
+        template["auto_review_model_override"] = None
+        template["comp_hash"] = None
 
+    def get_ranked_active_models(self) -> list[dict[str, Any]]:
+        """动态评估并排出所有可用的内置活跃模型"""
+        candidates = []
+        for idx, (slug, m) in enumerate(self.builtin_models_map.items()):
+            # 1. 强力排除已停用/已配置迁移的模型
+            if m.get("upgrade"):
+                continue
+
+            # 2. 必须支持 API 且有消息模板
+            if not m.get("supported_in_api", True):
+                continue
+            if not m.get("model_messages") or not m.get("context_window"):
+                continue
+
+            # 提取排序特征
+            ver = parse_model_version(slug)
+            is_list = 1 if m.get("visibility") == "list" else 0
+            priority = m.get("priority")
+            priority_val = int(priority) if isinstance(priority, (int, float)) else 999
+            ctx = int(m.get("context_window", 0))
+
+            candidates.append({
+                "model": m,
+                "slug": slug,
+                "version": ver,
+                "is_list": is_list,
+                "priority": priority_val,
+                "context_window": ctx,
+                "upstream_idx": idx
+            })
+
+        # 综合排序规则：
+        # 1. is_list: 优先已公开发布的模型 (list 优先于 hide)
+        # 2. version: 代际版本号越高越好 (6.0 > 5.6 > 5.4)
+        # 3. -priority: 官方 Priority 数值越小排位越靠前 (0/1 最好)
+        # 4. context_window: 窗口越大越好
+        # 5. -upstream_idx: 官方列表出现越靠前越好
+        candidates.sort(
+            key=lambda x: (
+                x["is_list"],
+                x["version"],
+                -x["priority"],
+                x["context_window"],
+                -x["upstream_idx"]
+            ),
+            reverse=True
+        )
+        return candidates
+
+    def select_template_interactively(self):
+        """启动时通过光标（↑/↓）交互式选择基准克隆模板，默认指向推荐项，回车即确认"""
+        self.active_candidates = self.get_ranked_active_models()
+
+        if not self.active_candidates:
+            target = next(iter(self.builtin_models_map.values()))
+            print("⚠️ 未能通过规则匹配到健康活跃模型，自动选用首个内置模型兜底。")
+            self.template_model = copy.deepcopy(target)
+            self.sanitize_template(self.template_model)
+            self.default_context = int(self.template_model.get("context_window", 272000))
+            return
+
+        # 取前 8 个候选模型展示
+        display_count = min(len(self.active_candidates), 8)
+        candidates_to_show = self.active_candidates[:display_count]
+        cursor_idx = 0  # 初始光标停在第 1 项（最推荐的主力旗舰）
+
+        while True:
+            # 清屏重绘光标选择界面
+            sys.stdout.write("\033[H\033[J")
+            print("🎯 请选择基准克隆模板（官方内置活跃旗舰模型）：")
+            print("💡 操作：[↑/↓] 移动光标 | [Enter] 确认选择（默认已高亮推荐项，可直接回车）")
+            print("=" * 86)
+
+            for i, c in enumerate(candidates_to_show):
+                vis_tag = "公开发布 [list]" if c["is_list"] else "隐藏预览 [hide]"
+                ver_str = f"v{c['version'][0]}.{c['version'][1]}"
+                rec_tag = " [★ 官方首推]" if i == 0 else ""
+                
+                line = f"{i + 1}. {c['slug']:<24} {ver_str:<6} | {vis_tag:<16} | Priority: {c['priority']:<2} | {c['context_window']:,} tokens{rec_tag}"
+
+                # 选中行反色高亮显示
+                if i == cursor_idx:
+                    sys.stdout.write(f"\033[1;36;7m > {line:<82}\033[0m\n")
+                else:
+                    sys.stdout.write(f"   {line}\n")
+
+            print("=" * 86)
+
+            k = get_key()
+            if k == 'UP':
+                cursor_idx = (cursor_idx - 1) % len(candidates_to_show)
+            elif k == 'DOWN':
+                cursor_idx = (cursor_idx + 1) % len(candidates_to_show)
+            elif k in ('ENTER', 'SPACE'):
+                break
+            elif k == 'ESC':
+                cursor_idx = 0  # 按 ESC 默认恢复第一项退出
+                break
+
+        target = candidates_to_show[cursor_idx]["model"]
+
+        # 克隆并安全清洗模板
         self.template_model = copy.deepcopy(target)
+        self.sanitize_template(self.template_model)
         self.default_context = int(self.template_model.get("context_window", 272000))
+
+        # 选完后简单提示，随即开始拉取代理模型
+        print(f"\n✅ 已选定基准克隆模板: \033[1;36m{self.template_model.get('slug')}\033[0m (Context: {self.default_context:,})")
 
     def load_existing_catalog(self) -> dict[str, dict[str, Any]] | None:
         """读取已有的 custom_catalog.json 以实现状态回显与幂等"""
@@ -338,13 +457,19 @@ class CodexCatalogApp:
 
     def render_list(self, edit_mode: bool = False):
         term_height = shutil.get_terminal_size().lines
-        max_display = max(8, term_height - 11)
+        max_display = max(6, term_height - 12)
         
         scroll_top = max(0, min(self.cursor_idx - max_display // 2, len(self.items) - max_display))
         scroll_bottom = min(len(self.items), scroll_top + max_display)
 
         sys.stdout.write("\033[H\033[J")
-        print(f"📦 Codex Catalog 配置器 | Provider: \033[1;32m{self.provider_name}\033[0m | 内置模型: {len(self.builtin_models_map)} 个 | 基准 Context: {self.default_context:,}")
+        
+        tmpl_slug = self.template_model.get("slug", "未知")
+        tmpl_ver = parse_model_version(tmpl_slug)
+        ver_str = f"v{tmpl_ver[0]}.{tmpl_ver[1]}"
+        
+        print(f"📦 Codex Catalog 配置器 | Provider: \033[1;32m{self.provider_name}\033[0m | 内置模型库: {len(self.builtin_models_map)} 个")
+        print(f"🎯 当前基准模板: \033[1;36m{tmpl_slug}\033[0m ({ver_str} | Priority: {self.template_model.get('priority', 0)} | Context: {self.default_context:,})")
         print("=" * 80)
 
         for idx in range(scroll_top, scroll_bottom):
@@ -533,19 +658,22 @@ class CodexCatalogApp:
                 continue
 
             m_id: str = it["id"]
+            # 基于清洗后的模板深拷贝
             entry: dict[str, Any] = copy.deepcopy(self.template_model)
             entry["slug"] = m_id
             entry["display_name"] = m_id
             entry["visibility"] = "list"
             entry["supported_in_api"] = True
             
-            # 自定义模型优先级从 max_builtin_priority + 1 开始顺延
+            # 【双保险】清除退役标记与特异性字段
+            entry["upgrade"] = None
+            entry["availability_nux"] = None
             entry["priority"] = start_custom_priority + custom_added_count
 
-            if it["state"] == "custom" and it["custom_context"] is not None:
-                entry["context_window"] = it["custom_context"]
-            else:
-                entry["context_window"] = self.default_context
+            # 同步更新 context_window 与 max_context_window
+            ctx_val = it["custom_context"] if (it["state"] == "custom" and it["custom_context"] is not None) else self.default_context
+            entry["context_window"] = ctx_val
+            entry["max_context_window"] = ctx_val
 
             final_catalog.append(entry)
             custom_added_count += 1
