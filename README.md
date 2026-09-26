@@ -78,7 +78,7 @@ uv run codex_catalog_builder.py
 > uv run codex-catalog
 > ```
 
-### 2. 打包为独立单文件可执行程序 (exe)
+### 2. 打包为独立单文件可执行程序
 
 无需在全局环境预装 PyInstaller，直接通过 `uv --with` 运行打包命令：
 
@@ -88,8 +88,9 @@ uv run --with pyinstaller pyinstaller -F -n codex-catalog codex_catalog_builder.
 
 打包完成后，可执行程序将生成在 `dist/` 目录下：
 - Windows: `dist/codex-catalog.exe`
+- Linux: `dist/codex-catalog`
 
-生成后可将 `codex-catalog.exe` 复制到系统的 `PATH` 目录（或任意便捷位置），直接在终端中随时调用。
+生成后可将对应平台的可执行程序复制到系统的 `PATH` 目录（或任意便捷位置），直接在终端中随时调用。
 
 ---
 

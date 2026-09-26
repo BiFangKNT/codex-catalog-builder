@@ -92,28 +92,54 @@ else:
     import termios
     import tty
     import select
+
     def get_key() -> str:
         fd = sys.stdin.fileno()
         old_settings = termios.tcgetattr(fd)
+
+        def read_next(timeout: float) -> bytes:
+            ready, _, _ = select.select([fd], [], [], timeout)
+            return os.read(fd, 1) if ready else b''
+
         try:
-            tty.setraw(fd)
-            ch = sys.stdin.read(1)
-            if ch == '\x03':  # Ctrl+C
+            tty.setraw(fd, when=termios.TCSANOW)
+            ch = os.read(fd, 1)
+            if ch == b'\x03':  # Ctrl+C
                 raise KeyboardInterrupt
-            if ch == '\x1b':
-                r, _, _ = select.select([sys.stdin], [], [], 0.05)
-                if r:
-                    ch2 = sys.stdin.read(1)
-                    if ch2 == '[':
-                        ch3 = sys.stdin.read(1)
-                        if ch3 == 'A': return 'UP'
-                        if ch3 == 'B': return 'DOWN'
+            if ch == b'\x1b':
+                prefix = read_next(0.05)
+                if not prefix:
+                    return 'ESC'
+                if prefix in (b'[', b'O'):
+                    for _ in range(16):
+                        part = read_next(0.05)
+                        if not part:
+                            break
+                        if b'@' <= part <= b'~':
+                            if part == b'A': return 'UP'
+                            if part == b'B': return 'DOWN'
+                            break
+                return 'OTHER'
+            if ch in (b'\r', b'\n'): return 'ENTER'
+            if ch == b' ': return 'SPACE'
+            if ch in (b'\x7f', b'\x08'): return 'BACKSPACE'
+
+            # 直接读文件描述符，避免 TextIOWrapper 预读方向键序列的后续字节。
+            first = ch[0]
+            if 0xc2 <= first <= 0xdf:
+                width = 2
+            elif 0xe0 <= first <= 0xef:
+                width = 3
+            elif 0xf0 <= first <= 0xf4:
+                width = 4
+            else:
+                width = 1
+            for _ in range(width - 1):
+                part = read_next(0.05)
+                if not part:
                     return 'OTHER'
-                return 'ESC'
-            if ch in ('\r', '\n'): return 'ENTER'
-            if ch == ' ': return 'SPACE'
-            if ch in ('\x7f', '\x08'): return 'BACKSPACE'
-            return ch
+                ch += part
+            return ch.decode('utf-8', errors='ignore')
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
@@ -531,6 +557,8 @@ class CodexCatalogApp:
                     cur["custom_context"] = None
                 else:
                     cur["state"] = "custom"
+                    if cur["custom_context"] is None:
+                        cur["custom_context"] = self.default_context
             elif key in ('e', 'E'):
                 cur = self.items[self.cursor_idx]
                 if cur["state"] == "excluded":
@@ -544,6 +572,8 @@ class CodexCatalogApp:
                     it["state"] = "included" if all_custom else "custom"
                     if it["state"] == "included":
                         it["custom_context"] = None
+                    elif it["custom_context"] is None:
+                        it["custom_context"] = self.default_context
             elif key in ('x', 'X'):
                 all_excluded = all(it["state"] == "excluded" for it in self.items)
                 for it in self.items:
