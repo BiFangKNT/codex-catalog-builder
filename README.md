@@ -1,4 +1,4 @@
-# Codex Catalog Builder (`codex-catalog`)
+# Codex Catalog Builder (`cxc` / `codex-catalog`)
 
 便捷、健壮的 OpenAI Codex 自定义模型目录交互式构建工具（TUI）。
 
@@ -75,8 +75,10 @@ uv run codex_catalog_builder.py
 
 > 也可以通过项目安装的全局命令别名运行：
 > ```bash
-> uv run codex-catalog
+> uv run cxc
 > ```
+>
+> 原有命令 `uv run codex-catalog` 仍然可用，两个命令调用同一入口。
 
 ### 2. 打包为独立单文件可执行程序
 

@@ -11,6 +11,7 @@ dependencies = [
 [project.scripts]
 # 全局命令名称 = "文件名:入口函数"
 codex-catalog = "codex_catalog_builder:main"
+cxc = "codex_catalog_builder:main"
 
 # 明确告诉 hatchling 打包这个单个文件
 [tool.hatch.build.targets.wheel]
