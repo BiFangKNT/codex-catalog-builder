@@ -65,6 +65,19 @@ experimental_bearer_token = "sk-xxxxxxxxxxxxxxxxxxxxxxxx"
 
 ## 🚀 快速开始
 
+### 从 PyPI 安装
+
+```bash
+uv tool install codex-catalog
+cxc
+```
+
+也可以免安装运行：
+
+```bash
+uvx --from codex-catalog cxc
+```
+
 ### 1. 开发环境直接运行
 
 使用 `uv` 无需手动创建虚拟环境，直接运行主程序：
