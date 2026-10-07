@@ -37,6 +37,30 @@ def atomic_save_json(path: Path, data: dict[str, Any]) -> None:
         raise
 
 
+def ensure_model_catalog_config() -> bool:
+    """仅在顶层缺少目录配置时添加路径，保留原有 TOML 内容。"""
+    original = CONFIG_PATH.read_bytes()
+    cfg = tomllib.loads(original.decode("utf-8"))
+    if "model_catalog_json" in cfg:
+        return False
+
+    # JSON 字符串的转义也适用于此处的 TOML 基本字符串。
+    catalog_value = json.dumps(str(CATALOG_PATH), ensure_ascii=False).replace("\x7f", "\\u007f")
+    newline = "\r\n" if b"\r\n" in original else "\n"
+    prefix = f"model_catalog_json = {catalog_value}{newline}".encode("utf-8")
+    temp_path = CONFIG_PATH.with_suffix(f".tmp.{os.getpid()}")
+    try:
+        with open(temp_path, "wb") as f:
+            f.write(prefix + original)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, CONFIG_PATH)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+    return True
+
+
 def load_proxy_config() -> tuple[str, str, str]:
     """从 ~/.codex/config.toml 中读取 model_provider 配置"""
     if not CONFIG_PATH.exists():
@@ -711,12 +735,21 @@ class CodexCatalogApp:
         # 4. 原子安全写入
         atomic_save_json(CATALOG_PATH, {"models": final_catalog})
 
+        # 5. 目录保存成功后补充顶层配置，已有配置保持不变。
+        try:
+            config_added = ensure_model_catalog_config()
+        except Exception as e:
+            print(f"\n⚠️ 目录已保存至 {CATALOG_PATH}，但更新 {CONFIG_PATH} 失败: {e}")
+            sys.exit(1)
+
         print("\n" + "=" * 80)
         print(f"🎉 成功生成 Model Catalog！总计包含 {len(final_catalog)} 个模型：")
         print(f"   ├─ 🏛️ 官方内置模型: {builtin_count} 个 (最大 Priority: {max_builtin_priority})")
         print(f"   ├─ 🚀 自定义模型:   {custom_added_count} 个 (Priority 范围: {start_custom_priority} ~ {start_custom_priority + custom_added_count - 1})")
         print(f"   └─ 🚫 已排除模型:   {excluded_count} 个")
         print(f"📁 已安全原子写入至: {CATALOG_PATH}")
+        if config_added:
+            print(f"📝 已在 {CONFIG_PATH} 顶层添加 model_catalog_json。")
         print("=" * 80)
         sys.exit(0)
 

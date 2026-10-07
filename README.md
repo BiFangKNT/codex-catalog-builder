@@ -141,7 +141,7 @@ uv run --with pyinstaller pyinstaller -F -n codex-catalog codex_catalog_builder.
 | `3` | **批量取消选中** | 输入序号范围将模型重置为默认模板 Context |
 | `4` | **批量排除模式** | 输入序号范围批量标记排除（不写入文件） |
 | `5` | **恢复排除模式** | 输入序号范围恢复为默认包含 |
-| `6` | **应用并退出** | 生成完整配置，原子写入 `~/.codex/custom_catalog.json` 并退出 |
+| `6` | **应用并退出** | 原子写入 `~/.codex/custom_catalog.json`，再检查 `config.toml` 顶层；缺少 `model_catalog_json` 时自动添加目录路径，已有配置保持不变 |
 
 #### 编辑模式快捷键
 
